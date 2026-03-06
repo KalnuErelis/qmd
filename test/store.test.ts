@@ -2011,6 +2011,22 @@ describe("Index Status", () => {
     await cleanupTestDb(store);
   });
 
+  test("getHashesNeedingEmbedding can scope by collection", async () => {
+    const store = await createTestStore();
+    const docsCollection = await createTestCollection({ name: "docs", pwd: "/test/docs" });
+    const notesCollection = await createTestCollection({ name: "notes", pwd: "/test/notes" });
+
+    await insertTestDocument(store.db, docsCollection, { name: "doc1", hash: "hash1" });
+    await insertTestDocument(store.db, docsCollection, { name: "doc2", hash: "hash2" });
+    await insertTestDocument(store.db, notesCollection, { name: "doc3", hash: "hash3" });
+
+    expect(store.getHashesNeedingEmbedding(["docs"])).toBe(2);
+    expect(store.getHashesNeedingEmbedding(["notes"])).toBe(1);
+    expect(store.getHashesNeedingEmbedding(["docs", "notes"])).toBe(3);
+
+    await cleanupTestDb(store);
+  });
+
   test("getIndexHealth returns health info", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();

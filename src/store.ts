@@ -773,7 +773,7 @@ export type Store = {
   ensureVecTable: (dimensions: number) => void;
 
   // Index health
-  getHashesNeedingEmbedding: () => number;
+  getHashesNeedingEmbedding: (collectionNames?: string | string[]) => number;
   getIndexHealth: () => IndexHealthInfo;
   getStatus: () => IndexStatus;
 
@@ -832,7 +832,7 @@ export type Store = {
   getActiveDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
-  getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
+  getHashesForEmbedding: (collectionNames?: string | string[]) => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
 };
@@ -856,7 +856,7 @@ export function createStore(dbPath?: string): Store {
     ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
 
     // Index health
-    getHashesNeedingEmbedding: () => getHashesNeedingEmbedding(db),
+    getHashesNeedingEmbedding: (collectionNames?: string | string[]) => getHashesNeedingEmbedding(db, collectionNames),
     getIndexHealth: () => getIndexHealth(db),
     getStatus: () => getStatus(db),
 
@@ -915,7 +915,7 @@ export function createStore(dbPath?: string): Store {
     getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
 
     // Vector/embedding operations
-    getHashesForEmbedding: () => getHashesForEmbedding(db),
+    getHashesForEmbedding: (collectionNames?: string | string[]) => getHashesForEmbedding(db, collectionNames),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
   };
@@ -1063,17 +1063,30 @@ export type IndexStatus = {
   collections: CollectionInfo[];
 };
 
+function normalizeCollectionFilters(collectionNames?: string | string[]): string[] {
+  if (!collectionNames) return [];
+  if (Array.isArray(collectionNames)) {
+    return collectionNames.filter((name): name is string => Boolean(name));
+  }
+  return collectionNames ? [collectionNames] : [];
+}
+
 // =============================================================================
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database): number {
+export function getHashesNeedingEmbedding(db: Database, collectionNames?: string | string[]): number {
+  const filters = normalizeCollectionFilters(collectionNames);
+  const collectionClause = filters.length > 0
+    ? ` AND d.collection IN (${filters.map(() => "?").join(", ")})`
+    : "";
+
   const result = db.prepare(`
     SELECT COUNT(DISTINCT d.hash) as count
     FROM documents d
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
-  `).get() as { count: number };
+    WHERE d.active = 1 AND v.hash IS NULL${collectionClause}
+  `).get(...filters) as { count: number };
   return result.count;
 }
 
@@ -2253,15 +2266,20 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Get all unique content hashes that need embeddings (from active documents).
  * Returns hash, document body, and a sample path for display purposes.
  */
-export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
+export function getHashesForEmbedding(db: Database, collectionNames?: string | string[]): { hash: string; body: string; path: string }[] {
+  const filters = normalizeCollectionFilters(collectionNames);
+  const collectionClause = filters.length > 0
+    ? ` AND d.collection IN (${filters.map(() => "?").join(", ")})`
+    : "";
+
   return db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
+    WHERE d.active = 1 AND v.hash IS NULL${collectionClause}
     GROUP BY d.hash
-  `).all() as { hash: string; body: string; path: string }[];
+  `).all(...filters) as { hash: string; body: string; path: string }[];
 }
 
 /**

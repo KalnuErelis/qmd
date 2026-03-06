@@ -7,12 +7,13 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
+import { openDatabase } from "../src/db.js";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -394,6 +395,92 @@ describe("CLI Update Command", () => {
     const { stdout, exitCode } = await runQmd(["update"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Updating");
+  });
+
+  test("updates only the selected collection", async () => {
+    const env = await createIsolatedTestEnv("scoped-update");
+    const dbPath = env.dbPath;
+    const configDir = env.configDir;
+    const otherDir = join(testDir, "other-update-fixtures");
+
+    await mkdir(otherDir, { recursive: true });
+    await writeFile(join(otherDir, "other.md"), "# Other Collection\n\nScoped update test.\n");
+
+    expect((await runQmd(["collection", "add", fixturesDir, "--name", "fixtures"], { dbPath, configDir })).exitCode).toBe(0);
+    expect((await runQmd(["collection", "add", otherDir, "--name", "other"], { dbPath, configDir })).exitCode).toBe(0);
+
+    const resetDb = openDatabase(dbPath);
+    resetDb.exec("DELETE FROM documents");
+    resetDb.exec("DELETE FROM content");
+    resetDb.exec("DELETE FROM content_vectors");
+    resetDb.exec("DROP TABLE IF EXISTS vectors_vec");
+    resetDb.close();
+
+    const result = await runQmd(["update", "-c", "fixtures"], { dbPath, configDir });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("selected collection");
+
+    const db = openDatabase(dbPath);
+    const counts = db.prepare(
+      "SELECT collection, COUNT(*) as count FROM documents WHERE active = 1 GROUP BY collection ORDER BY collection",
+    ).all() as Array<{ collection: string; count: number }>;
+    db.close();
+
+    expect(counts).toEqual([{ collection: "fixtures", count: 6 }]);
+  });
+
+  test("blocks embed when another write command lock exists", async () => {
+    const env = await createIsolatedTestEnv("write-lock");
+    const dbPath = env.dbPath;
+    const configDir = env.configDir;
+    const lockDir = join(dirname(dbPath), "locks");
+    const lockPath = join(lockDir, `write-${dbPath.replace(/[^a-zA-Z0-9._-]+/g, "_")}.lock`);
+
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(lockPath, JSON.stringify({
+      pid: process.pid,
+      command: "update",
+      dbPath,
+      startedAt: new Date().toISOString(),
+    }, null, 2));
+
+    try {
+      const result = await runQmd(["embed"], { dbPath, configDir });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("already running");
+    } finally {
+      unlinkSync(lockPath);
+    }
+  });
+});
+
+describe("CLI Embed Command", () => {
+  test("embeds only the selected collection", async () => {
+    const env = await createIsolatedTestEnv("scoped-embed");
+    const dbPath = env.dbPath;
+    const configDir = env.configDir;
+    const otherDir = join(testDir, "other-embed-fixtures");
+
+    await mkdir(otherDir, { recursive: true });
+    await writeFile(join(otherDir, "other.md"), "# Other Embed\n\nScoped embed test.\n");
+
+    expect((await runQmd(["collection", "add", fixturesDir, "--name", "fixtures"], { dbPath, configDir })).exitCode).toBe(0);
+    expect((await runQmd(["collection", "add", otherDir, "--name", "other"], { dbPath, configDir })).exitCode).toBe(0);
+
+    const result = await runQmd(["embed", "-c", "fixtures"], { dbPath, configDir });
+    expect(result.exitCode).toBe(0);
+
+    const db = openDatabase(dbPath);
+    const embeddedCollections = db.prepare(`
+      SELECT DISTINCT d.collection
+      FROM content_vectors v
+      JOIN documents d ON d.hash = v.hash
+      WHERE d.active = 1
+      ORDER BY d.collection
+    `).all() as Array<{ collection: string }>;
+    db.close();
+
+    expect(embeddedCollections).toEqual([{ collection: "fixtures" }]);
   });
 });
 
@@ -971,8 +1058,8 @@ describe("status and collection list hide filesystem paths", () => {
 
     // Should show qmd:// URIs
     expect(stdout).toContain(`qmd://${collName}/`);
-    // Should NOT show full filesystem paths (except for the index location which is ok)
-    const lines = stdout.split('\n').filter(l => !l.includes('Index:'));
+    // Should NOT show full filesystem paths (except for the index/config locations which are ok)
+    const lines = stdout.split('\n').filter(l => !l.includes('Index:') && !l.includes('Config:'));
     const pathLines = lines.filter(l => l.includes('/Users/') || l.includes('/home/') || l.includes('/tmp/'));
     expect(pathLines.length).toBe(0);
   });

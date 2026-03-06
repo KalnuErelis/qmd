@@ -86,6 +86,7 @@ import {
   removeContext as yamlRemoveContext,
   setGlobalContext,
   listAllContexts,
+  getConfigPath,
   setConfigIndexName,
 } from "./collections.js";
 
@@ -161,9 +162,105 @@ const cursor = {
   show() { process.stderr.write('\x1b[?25h'); },
 };
 
-// Ensure cursor is restored on exit
-process.on('SIGINT', () => { cursor.show(); process.exit(130); });
-process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
+let activeRunLockPath: string | null = null;
+
+function sanitizeLockName(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
+function getRunLockPath(): string {
+  const dbPath = getDbPath();
+  const lockDir = pathJoin(dirname(dbPath), "locks");
+  mkdirSync(lockDir, { recursive: true });
+  return pathJoin(lockDir, `write-${sanitizeLockName(dbPath)}.lock`);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseRunLock(): void {
+  if (!activeRunLockPath) return;
+
+  try {
+    if (existsSync(activeRunLockPath)) {
+      unlinkSync(activeRunLockPath);
+    }
+  } catch {
+    // Best-effort cleanup only.
+  } finally {
+    activeRunLockPath = null;
+  }
+}
+
+function acquireRunLock(commandName: "update" | "embed"): void {
+  const lockPath = getRunLockPath();
+  const payload = JSON.stringify({
+    pid: process.pid,
+    command: commandName,
+    dbPath: getDbPath(),
+    startedAt: new Date().toISOString(),
+  }, null, 2);
+
+  for (;;) {
+    try {
+      writeFileSync(lockPath, payload, { encoding: "utf-8", flag: "wx" });
+      activeRunLockPath = lockPath;
+      return;
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code !== "EEXIST") {
+        throw error;
+      }
+
+      try {
+        const raw = readFileSync(lockPath, "utf-8");
+        const lock = JSON.parse(raw) as { pid?: number; command?: string; dbPath?: string };
+        if (lock.pid && lock.pid !== process.pid && isProcessAlive(lock.pid)) {
+          console.error(
+            `${c.yellow}${lock.command || "A qmd write command"} is already running for index ${lock.dbPath || getDbPath()} (pid ${lock.pid}).${c.reset}`,
+          );
+          console.error("Wait for it to finish or remove the stale lock if the process is gone.");
+          process.exit(1);
+        }
+      } catch {
+        // Fall through and clean up stale or malformed locks.
+      }
+
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // Another process may have removed or replaced it. Retry acquisition.
+      }
+    }
+  }
+}
+
+async function withRunLock<T>(commandName: "update" | "embed", fn: () => Promise<T>): Promise<T> {
+  acquireRunLock(commandName);
+  try {
+    return await fn();
+  } finally {
+    releaseRunLock();
+  }
+}
+
+// Ensure cursor and locks are restored on exit
+process.on('SIGINT', () => {
+  cursor.show();
+  releaseRunLock();
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  cursor.show();
+  releaseRunLock();
+  process.exit(143);
+});
 
 // Terminal progress bar using OSC 9;4 escape sequence
 const progress = {
@@ -271,6 +368,7 @@ function formatBytes(bytes: number): string {
 
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
+  const configPath = getConfigPath();
   const db = getDb();
 
   // Collections are defined in YAML; no duplicate cleanup needed.
@@ -296,6 +394,7 @@ async function showStatus(): Promise<void> {
 
   console.log(`${c.bold}QMD Status${c.reset}\n`);
   console.log(`Index: ${dbPath}`);
+  console.log(`Config: ${configPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
   // MCP daemon status (check PID file liveness)
@@ -463,23 +562,34 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
-async function updateCollections(): Promise<void> {
+async function updateCollections(collectionNames: string[] = []): Promise<void> {
   const db = getDb();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = listCollections(db);
+  const allCollections = listCollections(db);
+  const collections = collectionNames.length > 0
+    ? allCollections.filter((collection) => collectionNames.includes(collection.name))
+    : allCollections;
 
   if (collections.length === 0) {
-    console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
+    if (collectionNames.length > 0) {
+      console.log(`${c.dim}No matching collections found: ${collectionNames.join(", ")}.${c.reset}`);
+    } else {
+      console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
+    }
     closeDb();
     return;
   }
 
   // Don't close db here - indexFiles will reuse it and close at the end
-  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
+  if (collectionNames.length > 0) {
+    console.log(`${c.bold}Updating ${collections.length} selected collection(s)...${c.reset}\n`);
+  } else {
+    console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
+  }
 
   for (let i = 0; i < collections.length; i++) {
     const col = collections[i];
@@ -528,12 +638,18 @@ async function updateCollections(): Promise<void> {
 
   // Check if any documents need embedding (show once at end)
   const finalDb = getDb();
-  const needsEmbedding = getHashesNeedingEmbedding(finalDb);
+  const needsEmbedding = getHashesNeedingEmbedding(finalDb, collectionNames);
   closeDb();
 
-  console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  if (collectionNames.length > 0) {
+    console.log(`${c.green}✓ Selected collections updated.${c.reset}`);
+  } else {
+    console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  }
   if (needsEmbedding > 0) {
-    console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+    const collectionArgs = collectionNames.flatMap((name) => ["-c", name]).join(" ");
+    const scopedSuffix = collectionArgs ? ` ${collectionArgs}` : "";
+    console.log(`\nRun 'qmd embed${scopedSuffix}' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
 }
 
@@ -1530,9 +1646,19 @@ function renderProgressBar(percent: number, width: number = 30): string {
   return bar;
 }
 
-async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
+async function vectorIndex(
+  model: string = DEFAULT_EMBED_MODEL,
+  force: boolean = false,
+  collectionNames: string[] = [],
+): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
+
+  if (force && collectionNames.length > 0) {
+    console.error("`qmd embed -f` currently refreshes the full index. Do not combine `-f` with `-c/--collection`.");
+    closeDb();
+    process.exit(1);
+  }
 
   // If force, clear all vectors
   if (force) {
@@ -1541,10 +1667,14 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   }
 
   // Find unique hashes that need embedding (from active documents)
-  const hashesToEmbed = getHashesForEmbedding(db);
+  const hashesToEmbed = getHashesForEmbedding(db, collectionNames);
 
   if (hashesToEmbed.length === 0) {
-    console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+    if (collectionNames.length > 0) {
+      console.log(`${c.green}✓ All content hashes in the selected collections already have embeddings.${c.reset}`);
+    } else {
+      console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+    }
     closeDb();
     return;
   }
@@ -2359,8 +2489,8 @@ function showHelp(): void {
   console.log("");
   console.log("Maintenance:");
   console.log("  qmd status                    - View index + collection health");
-  console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
-  console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
+  console.log("  qmd update [--pull] [-c name] - Re-index collections (optionally git pull first)");
+  console.log("  qmd embed [-f] [-c name]      - Generate/refresh vector embeddings");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -2402,7 +2532,7 @@ function showHelp(): void {
   console.log("  - Advanced: `qmd mcp --http ...` and `qmd mcp --http --daemon` are optional for custom transports.");
   console.log("");
   console.log("Global options:");
-  console.log("  --index <name>             - Use a named index (default: index)");
+  console.log("  --index <name>             - Use a named index (separate sqlite db + YAML config)");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
@@ -2714,11 +2844,17 @@ if (isMain) {
       break;
 
     case "update":
-      await updateCollections();
+      await withRunLock("update", async () => {
+        const collectionNames = resolveCollectionFilter(cli.values.collection as string | string[] | undefined);
+        await updateCollections(collectionNames);
+      });
       break;
 
     case "embed":
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
+      await withRunLock("embed", async () => {
+        const collectionNames = resolveCollectionFilter(cli.values.collection as string | string[] | undefined);
+        await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force, collectionNames);
+      });
       break;
 
     case "pull": {

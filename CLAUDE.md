@@ -17,8 +17,8 @@ qmd context rm <path>             # Remove context
 qmd get <file>                    # Get document by path or docid (#abc123)
 qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated list
 qmd status                        # Show index status and collections
-qmd update [--pull]               # Re-index all collections (--pull: git pull first)
-qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
+qmd update [--pull] [-c <name>]   # Re-index all collections or one collection (--pull: git pull first)
+qmd embed [-c <name>]             # Generate vector embeddings for all or one collection
 qmd query <query>                 # Search with query expansion + reranking (recommended)
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)

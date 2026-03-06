@@ -366,7 +366,7 @@ qmd query "user authentication"
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
---index <name>     # Use named index
+--index <name>     # Use named index (separate sqlite db + YAML config)
 
 # Output formats (for search and multi-get)
 --files            # Output: docid,score,filepath,context
@@ -441,8 +441,14 @@ qmd status
 # Re-index all collections
 qmd update
 
+# Re-index just one collection
+qmd update -c docs
+
 # Re-index with git pull first (for remote repos)
 qmd update --pull
+
+# Embed just one collection
+qmd embed -c docs
 
 # Get document by filepath (with fuzzy matching suggestions)
 qmd get notes/meeting.md
